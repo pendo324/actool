@@ -236,6 +236,9 @@ fn matches_apple_structure_for_primary_and_alternate() {
         if let Some(p) = a.get("payload") {
             assert_eq!(payload, p.as_str().unwrap(), "payload of {key}");
         }
+        if let Some(p) = a.get("payload_head") {
+            assert_eq!(&payload[..32], p.as_str().unwrap(), "codec header of {key}");
+        }
     }
 
     assert_eq!(

@@ -51,7 +51,7 @@ def load(path):
             "size": [csi["width"], csi["height"]],
             "scale": csi["scale"],
             "tlv_tags": csi["tlv_tags"],
-            "celm": None if csi["celm"] is None else [csi["celm"]["ver"], csi["celm"]["comp"]],
+            "celm": None if csi["celm"] is None else [csi["celm"]["ver"], csi["celm"]["comp"], csi["celm"]["payload_len"]],
         }
         if csi["layout_name"] in STRUCTURAL_LAYOUTS:
             info["tlv"] = vb[184:184 + csi["tlv_len"]].hex()
@@ -131,6 +131,9 @@ def golden(path):
         }
         if csi["layout_name"] in STRUCTURAL_LAYOUTS:
             entry["payload"] = csi["rend_raw"].hex()
+        elif csi["rend_raw"][:4] == b"MLEC":
+            # Bitmap codec header: version, compression, KCBC chunk count.
+            entry["payload_head"] = csi["rend_raw"][:16].hex()
         rends[kb.hex()] = entry
     return {
         "keyformat": car["keyformat"],
