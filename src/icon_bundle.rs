@@ -2497,6 +2497,9 @@ fn write_icon_car_with(
     mut appearance_entries: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<()> {
     let mut bom = BomWriter::new();
+    // iOS catalogs repeat every flattened 1024 pt image for phone and pad
+    // (byte-identical); store each once. macOS output stays byte-for-byte.
+    bom.set_share_identical_values(key_semantics == 2);
     // Declare CoreUI 975 so the IconComposer code paths in CoreUI activate
     // — older values cause silent `imagesWithName:` empty results even when
     // FACETKEYS / RENDITIONS are byte-identical to Apple's output.

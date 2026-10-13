@@ -5,6 +5,7 @@
 
 use byteorder::{BigEndian, WriteBytesExt};
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -12,6 +13,9 @@ pub struct BomWriter {
     blocks: Vec<Vec<u8>>,
     named_blocks: IndexMap<String, usize>,
     inline_key_size: Option<usize>,
+    /// Identical tree values written once, with every entry pointing at it
+    /// (see `set_share_identical_values`).
+    shared_values: Option<HashMap<Vec<u8>, usize>>,
 }
 
 impl BomWriter {
@@ -20,7 +24,28 @@ impl BomWriter {
             blocks: vec![Vec::new()], // block 0 is always empty
             named_blocks: IndexMap::new(),
             inline_key_size: None,
+            shared_values: None,
         }
+    }
+
+    /// Store each distinct tree value once: later `add_tree` entries whose
+    /// value is byte-identical to an earlier one point at the same block.
+    /// CoreUI finds a rendition by key and reads whatever block the entry
+    /// names, so the keys are unchanged. Apple's actool doesn't do this; an
+    /// iOS icon catalog repeats each 1024 pt image for phone and pad.
+    pub fn set_share_identical_values(&mut self, share: bool) {
+        self.shared_values = share.then(HashMap::new);
+    }
+
+    fn add_value_block(&mut self, data: &[u8]) -> usize {
+        if let Some(&idx) = self.shared_values.as_ref().and_then(|m| m.get(data)) {
+            return idx;
+        }
+        let idx = self.add_block(data.to_vec());
+        if let Some(map) = self.shared_values.as_mut() {
+            map.insert(data.to_vec(), idx);
+        }
+        idx
     }
 
     /// Set the fixed key size for subsequent `add_tree` calls. When set, the
@@ -165,7 +190,7 @@ impl BomWriter {
         node.write_u32::<BigEndian>(backward).unwrap();
         let mut key_blob: Vec<u8> = Vec::new();
         for (key_data, value_data) in entries {
-            let val_idx = self.add_block(value_data.clone());
+            let val_idx = self.add_value_block(value_data);
             let key_idx = self.add_block(key_data.clone());
             node.write_u32::<BigEndian>(val_idx as u32).unwrap();
             node.write_u32::<BigEndian>(key_idx as u32).unwrap();
@@ -455,6 +480,35 @@ mod tests {
         assert_eq!(&data[..8], b"BOMStore");
         // The bytes "world data" must appear somewhere in the output
         assert!(data.windows(10).any(|w| w == b"world data"));
+    }
+
+    #[test]
+    fn identical_values_shared_when_enabled() {
+        let entries = vec![
+            (b"key1".to_vec(), b"same value".to_vec()),
+            (b"key2".to_vec(), b"same value".to_vec()),
+            (b"key3".to_vec(), b"other".to_vec()),
+        ];
+        let count = |data: &[u8]| data.windows(10).filter(|w| *w == b"same value").count();
+        let mut plain = BomWriter::new();
+        plain.add_tree("TREE", &entries, 4096);
+        assert_eq!(count(&plain.to_bytes()), 2);
+
+        let mut shared = BomWriter::new();
+        shared.set_share_identical_values(true);
+        shared.add_tree("TREE", &entries, 4096);
+        let data = shared.to_bytes();
+        assert_eq!(count(&data), 1);
+        // Both keys are still in the tree, pointing at one value block.
+        assert!(data.windows(4).any(|w| w == b"key1"));
+        assert!(data.windows(4).any(|w| w == b"key2"));
+        let leaf = &shared.blocks[1..]
+            .iter()
+            .find(|b| b.len() >= 4096 && b[1] == 1)
+            .expect("leaf node");
+        let value = |i: usize| u32::from_be_bytes(leaf[12 + 8 * i..16 + 8 * i].try_into().unwrap());
+        assert_eq!(value(0), value(1));
+        assert_ne!(value(0), value(2));
     }
 
     #[test]
