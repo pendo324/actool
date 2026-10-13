@@ -429,6 +429,14 @@ fn lzfse_compress(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Rows per KCBC chunk and the resulting chunk count: a third of the image
+/// per chunk, so a height that isn't a multiple of 3 gets a fourth, short
+/// chunk (1024 rows → 341 + 341 + 341 + 1).
+fn kcbc_chunking(height: u32) -> (usize, u32) {
+    let rows = if height >= 3 { (height / 3) as usize } else { height.max(1) as usize };
+    (rows, (height as usize).div_ceil(rows) as u32)
+}
+
 fn compress_kcbc(pixel_data: &[u8], height: u32) -> Option<Vec<u8>> {
     if pixel_data.is_empty() || height == 0 {
         return None;
@@ -437,11 +445,7 @@ fn compress_kcbc(pixel_data: &[u8], height: u32) -> Option<Vec<u8>> {
     if bpr == 0 {
         return None;
     }
-    let rows_per_chunk = if height >= 3 {
-        (height / 3) as usize
-    } else {
-        height as usize
-    };
+    let (rows_per_chunk, _) = kcbc_chunking(height);
     let mut out = Vec::new();
     let mut row = 0usize;
     let total = height as usize;
@@ -508,7 +512,9 @@ pub fn compress_data(
             out.extend_from_slice(b"MLEC");
             out.write_u32::<LittleEndian>(celm_ver).unwrap();
             out.write_u32::<LittleEndian>(4).unwrap();
-            out.write_u32::<LittleEndian>(3).unwrap();
+            // The chunk count: CoreUI decodes only this many chunks, so a
+            // fixed 3 left the last row of a 1024 px image black.
+            out.write_u32::<LittleEndian>(kcbc_chunking(height).1).unwrap();
             out.extend_from_slice(b"KCBC");
             out.extend_from_slice(&kcbc);
             return out;
@@ -1909,6 +1915,17 @@ mod tests {
         assert_eq!(&out[..4], b"MLEC");
         let comp = u32::from_le_bytes(out[8..12].try_into().unwrap());
         assert_eq!(comp, 0);
+    }
+
+    #[test]
+    fn kcbc_header_counts_every_chunk() {
+        assert_eq!(kcbc_chunking(1024), (341, 4));
+        assert_eq!(kcbc_chunking(1023), (341, 3));
+        assert_eq!(kcbc_chunking(2), (2, 1));
+        let px = vec![7u8; 1024 * 4 * 1024];
+        let out = compress_data(&px, b"BGRA", 1024, 1024, "17.0", "iphoneos", false, false, true);
+        assert_eq!(&out[..4], b"MLEC");
+        assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), 4);
     }
 
     #[test]
