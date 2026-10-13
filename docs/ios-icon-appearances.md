@@ -167,9 +167,14 @@ plain `fill` ignores its `fill-specializations`.
   looks (same output on macOS and Linux).
 * `examples/ios_icon_previews.rs`: writes those renders as PNGs.
 * Size: an iOS catalog stores each distinct rendition once
-  (`BomWriter::set_share_identical_values`), so the phone and pad 1024 pt
-  images and the layer SVGs repeated across icons share one block; keys
-  and rendition bytes are Apple's. Apple writes every copy: for the ten
+  (`BomWriter::set_share_identical_values`, keyed by SHA-256), so the phone
+  and pad 1024 pt images and the layer SVGs repeated across icons share one
+  block; keys are Apple's. Flattened images with identical pixels in
+  different icons (a light-only copy's Any, Dark and Tintable, icons with
+  the same day look, a shared tinted look) reuse the first icon's
+  rendition bytes, rendition name included (`FlattenedImages`, by SHA-256
+  of the pixels), so they share too; iOS selects by key, the name is
+  informational. Apple writes every copy: for the ten
   Phoebus icons Xcode 26.6 emits 47.8 MB (24.0 MB of identical blocks),
   this writer 12.8 MB. Both store the flattened images as opaque 8-bit
   ARGB, LZFSE; ours compress to about half of Apple's (smoother pixels,

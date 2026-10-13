@@ -15,7 +15,8 @@ pub struct BomWriter {
     inline_key_size: Option<usize>,
     /// Identical tree values written once, with every entry pointing at it
     /// (see `set_share_identical_values`).
-    shared_values: Option<HashMap<Vec<u8>, usize>>,
+    /// Keyed by the value's SHA-256 and length.
+    shared_values: Option<HashMap<([u8; 32], usize), usize>>,
 }
 
 impl BomWriter {
@@ -38,13 +39,17 @@ impl BomWriter {
     }
 
     fn add_value_block(&mut self, data: &[u8]) -> usize {
-        if let Some(&idx) = self.shared_values.as_ref().and_then(|m| m.get(data)) {
+        use sha2::{Digest, Sha256};
+        let Some(map) = self.shared_values.as_mut() else {
+            return self.add_block(data.to_vec());
+        };
+        let key = (Sha256::digest(data).into(), data.len());
+        if let Some(&idx) = map.get(&key) {
             return idx;
         }
-        let idx = self.add_block(data.to_vec());
-        if let Some(map) = self.shared_values.as_mut() {
-            map.insert(data.to_vec(), idx);
-        }
+        let idx = self.blocks.len();
+        map.insert(key, idx);
+        self.blocks.push(data.to_vec());
         idx
     }
 

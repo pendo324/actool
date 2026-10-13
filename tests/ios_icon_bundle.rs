@@ -359,3 +359,90 @@ fn cli_compiles_several_icon_documents_for_ios_only() {
         .unwrap();
     assert!(!status.status.success(), "several documents are iOS-only");
 }
+
+/// Copy a bundle under another name; `light_only` drops its dark
+/// specializations, as a light-only copy of an icon does.
+fn copy_bundle(src: &Path, dst: &Path, light_only: bool) {
+    fs::create_dir_all(dst.join("Assets")).unwrap();
+    for entry in fs::read_dir(src.join("Assets")).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), dst.join("Assets").join(entry.file_name())).unwrap();
+    }
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(src.join("icon.json")).unwrap()).unwrap();
+    fn drop_dark(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, x) in map.iter_mut() {
+                    if k.ends_with("-specializations") {
+                        if let serde_json::Value::Array(list) = x {
+                            list.retain(|e| e.get("appearance").and_then(|a| a.as_str()) != Some("dark"));
+                        }
+                    } else {
+                        drop_dark(x);
+                    }
+                }
+            }
+            serde_json::Value::Array(list) => list.iter_mut().for_each(drop_dark),
+            _ => {}
+        }
+    }
+    if light_only {
+        drop_dark(&mut doc);
+    }
+    fs::write(dst.join("icon.json"), serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+}
+
+#[test]
+fn identical_flattened_images_are_stored_once_across_icons() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    copy_bundle(&fixture("props.icon"), &src.join("props.icon"), false);
+    copy_bundle(&fixture("props.icon"), &src.join("props__light.icon"), true);
+    copy_bundle(&fixture("props.icon"), &src.join("props__same.icon"), false);
+    let bundles: Vec<PathBuf> = ["props", "props__light", "props__same"]
+        .iter()
+        .map(|n| src.join(format!("{n}.icon")))
+        .collect();
+    let out = dir.path().join("out");
+    let plist = out.join("partial.plist");
+    let alternates = vec!["props__light".to_string(), "props__same".to_string()];
+    let devices = both_devices();
+    compile_icon_bundles(&bundles, &out, &options(Some("props"), &alternates, &devices, &plist)).unwrap();
+    let car = Car::open(&out.join("Assets.car"));
+
+    // Flattened icon images (part 220) by (icon identifier, appearance, idiom)
+    // → value block index.
+    let kf = car.keyformat();
+    let attr = |key: &[u8], a: u16| -> u16 {
+        let i = kf.iter().position(|x| *x == a).unwrap();
+        le16(key, i * 2)
+    };
+    let root = be32(car.named_block("RENDITIONS"), 8);
+    let leaf = car.block(root);
+    assert_eq!(be16(leaf, 0), 1, "one leaf");
+    let mut images: HashMap<(u16, u16, u16), u32> = HashMap::new();
+    for k in 0..be16(leaf, 2) as usize {
+        let (value, key) = (be32(leaf, 12 + k * 8), be32(leaf, 16 + k * 8));
+        let key = car.block(key);
+        if attr(key, 2) == 220 {
+            images.insert((attr(key, 17), attr(key, 7), attr(key, 15)), value);
+        }
+    }
+    let ident = |name: &str| actool::name_hash::hash_name(name);
+    let (props, light, same) = (ident("props"), ident("props__light"), ident("props__same"));
+    for idiom in [1, 2] {
+        // Phone and pad share; an identical copy shares every look.
+        assert_eq!(images[&(props, 0, 1)], images[&(props, 0, idiom)]);
+        for appearance in [0, 1, 10] {
+            assert_eq!(images[&(props, appearance, idiom)], images[&(same, appearance, idiom)]);
+        }
+        // The light-only copy's Any and Tintable are the original's.
+        assert_eq!(images[&(light, 0, idiom)], images[&(props, 0, idiom)]);
+        assert_eq!(images[&(light, 10, idiom)], images[&(props, 10, idiom)]);
+    }
+    // Three icons, three distinct flattened images (props has a distinct dark look,
+    // the light copy's dark look is its own render).
+    let distinct: std::collections::HashSet<u32> = images.values().copied().collect();
+    assert!(distinct.len() <= 4, "{} distinct images", distinct.len());
+}

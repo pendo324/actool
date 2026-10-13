@@ -77,8 +77,9 @@ pub fn compile_icon_bundles(
     if !selected.is_empty() {
         let mut renditions: Vec<Rendition> = Vec::new();
         let mut facets: Vec<FacetEntry> = Vec::new();
+        let mut flattened = FlattenedImages::default();
         for bundle in &selected {
-            let built = build_bundle(bundle, opts)?;
+            let built = build_bundle(bundle, opts, &mut flattened)?;
             renditions.extend(built.renditions);
             facets.extend(built.facets);
             if Some(*bundle) == primary {
@@ -159,6 +160,41 @@ pub fn render_appearances(bundle: &Path) -> Result<Vec<(&'static str, Vec<u8>)>>
     Ok(out)
 }
 
+/// The flattened 1024 pt images compiled so far, by pixel content. Icons
+/// that share a look (an icon's light-only copy, two icons with the same day
+/// look, the tinted look most icons share) render identical pixels; the
+/// first rendition's bytes, rendition name included, are reused for the rest
+/// so the catalog stores them once (`BomWriter::set_share_identical_values`).
+/// iOS finds a rendition by its key; the name is informational.
+#[derive(Default)]
+struct FlattenedImages {
+    csi: std::collections::HashMap<FlattenedKey, Vec<u8>>,
+}
+
+/// SHA-256 and length of the pixels, and how they are stored.
+#[derive(PartialEq, Eq, Hash)]
+struct FlattenedKey {
+    sha256: [u8; 32],
+    len: usize,
+    pixel_format: [u8; 4],
+    colorspace_id: u32,
+    variant: u16,
+}
+
+impl FlattenedImages {
+    fn csi_for(&mut self, rendition: &Rendition) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let key = FlattenedKey {
+            sha256: Sha256::digest(&rendition.pixel_data).into(),
+            len: rendition.pixel_data.len(),
+            pixel_format: rendition.pixel_format,
+            colorspace_id: rendition.colorspace_id,
+            variant: rendition.variant,
+        };
+        self.csi.entry(key).or_insert_with(|| rendition.build_csi()).clone()
+    }
+}
+
 struct BuiltBundle {
     renditions: Vec<Rendition>,
     facets: Vec<FacetEntry>,
@@ -166,7 +202,11 @@ struct BuiltBundle {
     any_rgba: Vec<u8>,
 }
 
-fn build_bundle(bundle: &Path, opts: &IosIconOptions) -> Result<BuiltBundle> {
+fn build_bundle(
+    bundle: &Path,
+    opts: &IosIconOptions,
+    flattened: &mut FlattenedImages,
+) -> Result<BuiltBundle> {
     let json_path = bundle.join("icon.json");
     let text = fs::read_to_string(&json_path)
         .map_err(|e| anyhow::anyhow!("could not read {}: {e}", json_path.display()))?;
@@ -260,8 +300,9 @@ fn build_bundle(bundle: &Path, opts: &IosIconOptions) -> Result<BuiltBundle> {
             template_rendering_intent: 0,
             ..Rendition::default()
         };
-        // Phone and pad share the rendition bytes; compress once.
-        let csi = base.build_csi();
+        // Phone and pad share the rendition bytes; compress once, and reuse
+        // an identical image another icon already has.
+        let csi = flattened.csi_for(&base);
         for idiom in IDIOMS {
             renditions.push(Rendition {
                 idiom,
