@@ -1,19 +1,18 @@
-//! SVG rasterization via macOS CoreSVG private framework.
+//! SVG rasterization: macOS CoreSVG private framework, with a resvg fallback.
 //!
 //! Mirrors the Python implementation that calls `CGSVGDocumentCreateFromData`
 //! and `CGContextDrawSVGDocument` from `PrivateFrameworks/CoreSVG.framework`.
 //! Rust-native SVG renderers (resvg, etc.) will not match Apple's output
-//! byte-for-byte, so we use the same private API the system `actool` does.
+//! byte-for-byte, so on macOS we use the same private API the system `actool`
+//! does.
 //!
 //! All of the CoreGraphics/CoreSVG FFI lives in the macOS-only [`imp`] module.
-//! On every other platform `rasterize_svg`/`has_coresvg` are safe no-ops
-//! ([`has_coresvg`] returns `false`; [`rasterize_svg`] returns an error), so the
-//! crate compiles and links without referencing any Apple framework. Callers
-//! gate on `has_coresvg()` (xcassets) or treat the error as "SVG unsupported
-//! here" (`.icon`), exactly as on macOS when the framework is unavailable.
+//! Elsewhere (or when CoreSVG can't be loaded) [`rasterize_svg`] falls back to
+//! resvg, so `.icon` SVG layers compile on Linux. [`has_coresvg`] still reports
+//! only CoreSVG: the xcassets path gates its Apple-parity SVG rasterizations on
+//! it and keeps skipping them off macOS.
 
-#[cfg(not(target_os = "macos"))]
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use regex::Regex;
 
 /// Extract (width, height) from SVG root element attributes. Falls back
@@ -49,23 +48,45 @@ pub fn has_coresvg() -> bool {
     false
 }
 
-/// Safe no-op on non-macOS: there is no CoreSVG framework to call, so report
-/// the failure and let the caller skip/fall back (it never panics or links an
-/// Apple framework).
-#[cfg(not(target_os = "macos"))]
-pub fn rasterize_svg(
-    _svg_data: &[u8],
-    _width: u32,
-    _height: u32,
-    _scale: u32,
-) -> Result<Vec<u8>> {
-    Err(anyhow::anyhow!(
-        "CoreSVG rasterization is only available on macOS"
-    ))
+#[cfg(target_os = "macos")]
+pub use imp::has_coresvg;
+
+/// Rasterize SVG data into a `BGRA` (little-endian ARGB premultiplied) pixel
+/// buffer of `(width*scale) x (height*scale)`, scaling the SVG to fill it.
+/// Uses CoreSVG when it's available, resvg otherwise.
+pub fn rasterize_svg(svg_data: &[u8], width: u32, height: u32, scale: u32) -> Result<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    if imp::has_coresvg() {
+        return imp::rasterize_svg(svg_data, width, height, scale);
+    }
+    rasterize_svg_resvg(svg_data, width, height, scale)
 }
 
-#[cfg(target_os = "macos")]
-pub use imp::{has_coresvg, rasterize_svg};
+/// Pure-Rust rasterization with resvg, in the same premultiplied BGRA layout
+/// CoreSVG produces.
+pub fn rasterize_svg_resvg(
+    svg_data: &[u8],
+    width: u32,
+    height: u32,
+    scale: u32,
+) -> Result<Vec<u8>> {
+    use resvg::{tiny_skia, usvg};
+    let pixel_w = width * scale;
+    let pixel_h = height * scale;
+    let tree = usvg::Tree::from_data(svg_data, &usvg::Options::default())
+        .map_err(|e| anyhow!("could not parse SVG: {e}"))?;
+    let mut pixmap = tiny_skia::Pixmap::new(pixel_w.max(1), pixel_h.max(1))
+        .ok_or_else(|| anyhow!("invalid SVG raster size {pixel_w}x{pixel_h}"))?;
+    let size = tree.size();
+    let sx = pixel_w as f32 / size.width();
+    let sy = pixel_h as f32 / size.height();
+    resvg::render(&tree, tiny_skia::Transform::from_scale(sx, sy), &mut pixmap.as_mut());
+    let mut data = pixmap.take();
+    for px in data.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    Ok(data)
+}
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -197,6 +218,7 @@ mod imp {
         load_syms().is_some()
     }
 
+
     /// Rasterize SVG data into a `BGRA` (little-endian ARGB premultiplied)
     /// pixel buffer of `(width*scale) x (height*scale)`.
     pub fn rasterize_svg(
@@ -307,6 +329,28 @@ mod tests {
     fn parse_missing() {
         let svg = br#"<svg></svg>"#;
         assert_eq!(parse_svg_dimensions(svg), (0, 0));
+    }
+
+    #[test]
+    fn resvg_rasterizes_premultiplied_bgra() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8" viewBox="0 0 8 8"><rect width="4" height="8" fill="#FF0000"/><rect x="4" width="4" height="8" fill="#0000FF" fill-opacity="0.5"/></svg>"##;
+        // Asked for 16x16: the 8-pt SVG is scaled to fill it.
+        let data = rasterize_svg_resvg(svg, 16, 16, 1).unwrap();
+        assert_eq!(data.len(), 16 * 16 * 4);
+        let px = |x: usize, y: usize| &data[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4];
+        assert_eq!(px(3, 8), &[0, 0, 255, 255], "left half is opaque red (BGRA)");
+        let right = px(12, 8);
+        assert!(right[0] >= 126 && right[0] <= 129 && right[3] >= 126 && right[3] <= 129,
+            "right half is premultiplied half-alpha blue: {right:?}");
+    }
+
+    #[test]
+    fn rasterize_svg_works_on_every_host() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="#00FF00"/></svg>"##;
+        let data = rasterize_svg(svg, 8, 8, 2).unwrap();
+        assert_eq!(data.len(), 16 * 16 * 4);
+        assert_eq!(data[(8 * 16 + 8) * 4 + 1], 0xFF);
+        assert_eq!(data[(8 * 16 + 8) * 4 + 3], 0xFF);
     }
 
     #[test]

@@ -156,9 +156,8 @@ fn write_synthetic_png(path: &Path, dim: u32, rgba: [u8; 4]) {
 }
 
 /// Encode a minimal synthetic SVG so we exercise the SVG-source `.icon`
-/// path without depending on any checked-in asset. SVG rasterization needs
-/// CoreSVG, so the helper and its tests are macOS-only.
-#[cfg(target_os = "macos")]
+/// path without depending on any checked-in asset. SVG layers rasterize with
+/// CoreSVG on macOS and resvg elsewhere.
 fn write_synthetic_svg(path: &Path) {
     let svg = br##"<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
@@ -485,7 +484,6 @@ fn solid_srgb_fill_emits_4_colors_1_gradient_with_user_color() {
 }
 
 #[test]
-#[cfg(target_os = "macos")] // SVG-source bundle requires CoreSVG rasterization
 fn svg_source_bundle_does_not_emit_legacy_pdf_only_catalog() {
     // The KYA SIGSEGV regression. Pre-d4ebe6f, an SVG-source `.icon`
     // would emit a single LAYOUT_PDF (9) rendition + a FACETKEYS entry
@@ -620,7 +618,6 @@ fn icns_gate_matches_apple_on_bundle_stem_vs_app_icon() {
 /// compiles and loads (both group facets present, BITMAPKEYS populated). The
 /// pixel-level multiply/stack behaviour is unit-tested in `icon_bundle`.
 #[test]
-#[cfg(target_os = "macos")] // SVG layer sources require CoreSVG rasterization
 fn two_overlapping_glass_groups_compile_and_load() {
     let dir = tempdir();
     let bundle = dir.path().join("MultiGlass.icon");
