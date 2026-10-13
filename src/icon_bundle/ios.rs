@@ -477,10 +477,10 @@ fn appearance_name(a: Appearance) -> &'static str {
 /// The layer's fill value for `appearance`: its plain `fill` (which Apple
 /// applies to every appearance), else the matching / default entry of its
 /// `fill-specializations`.
-fn layer_fill_value<'a>(
-    layer: &'a crate::icon_json::Layer,
+fn layer_fill_value(
+    layer: &crate::icon_json::Layer,
     appearance: Appearance,
-) -> Option<&'a serde_json::Value> {
+) -> Option<&serde_json::Value> {
     if let Some(Fill::Structured(v)) = layer.fill.as_ref() {
         return Some(v);
     }
@@ -858,7 +858,7 @@ fn write_ios_plist(
         lines.push("\t</dict>".to_string());
     };
     let phone = format!("{name}60x60");
-    section("CFBundleIcons", &[phone.clone()], iphone, true);
+    section("CFBundleIcons", std::slice::from_ref(&phone), iphone, true);
     section("CFBundleIcons~ipad", &[phone, format!("{name}76x76")], ipad, ipad);
     lines.push("</dict>".to_string());
     lines.push("</plist>".to_string());

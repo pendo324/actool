@@ -156,6 +156,8 @@ pub struct Scene {
 /// top, an S-shaped ramp towards the bottom whose depth grows faster than
 /// linearly with the value. Rows: value; columns: `TRANSLUCENCY_S`.
 const TRANSLUCENCY_S: [f32; 7] = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0];
+// Measured values; 0.318 is not 1/π.
+#[allow(clippy::approx_constant)]
 const TRANSLUCENCY_TABLE: [(f32, [f32; 7]); 6] = [
     (0.0, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
     (0.12, [0.0, 0.0, 0.007, 0.013, 0.020, 0.033, 0.046]),
