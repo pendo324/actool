@@ -312,6 +312,8 @@ Implemented (`car.rs::is_idiom_platform`/`idiom_value`/`deployment_platform_name
 - Imageset key format is fixed `[7,13,12,15,16,17,1,2]` (no trimming like macOS). CARHEADER = CoreUI **975** / key-semantics **2**. EXTENDED_METADATA platform string is **"ios"** (device family, not "iphoneos"). APPEARANCEKEYS always emits `UIAppearanceAny=0`. Imagesets keep iphone/ipad/universal and drop `mac` + `ios-marketing`.
 - **App icons**: emit loose `@2x` home-screen PNGs per idiom (`AppIcon60x60@2x.png`, `AppIcon76x76@2x~ipad.png` — primary sizes iphone=60/ipad=76; marketing is CAR-only) and the iOS partial plist (`CFBundleIcons`/`CFBundleIcons~ipad`, each with `CFBundleIconName` always and `CFBundleIconFiles` when the idiom ships an icon; iPad list = iPhone primary + iPad primary, populated only when iPad has an icon). No `.icns`. Icon renditions are idiom-tagged.
 
+- **`.icon` bundles on iOS** go through `icon_bundle/ios.rs` (several `.icon` documents per invocation: `--app-icon` + `--alternate-app-icon`). Structure matches Apple's rendition for rendition, including the per-appearance iconstack/IconGroup TLVs; check with `python3 tools/compare_ios_icon_car.py ours.car apple.car` and `tests/ios_icon_bundle.rs`. Findings and parity numbers: `docs/ios-icon-appearances.md`.
+
 **App-icon CAR parity still incomplete** (reference via `/usr/bin/actool --platform iphoneos --app-icon AppIcon`). The CAR loads (`validate_car` OK) but does not byte-match.
 
 Done: the key format now byte-matches Apple's `[7,13,12,15,16,9,8,17,1,2]`.

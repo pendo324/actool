@@ -7,7 +7,11 @@ who described the file structure.
 
 This tool supports the lzfse compression for assets, but not the palette format. It supports deepmap2 format, but only by using the private APIs on MacOS. You can still run it on Linux and fall back to lzfse or earlier. 
 
-It can handle both car asset archives and icon files.
+It can handle both car asset archives and icon files. IconComposer `.icon`
+bundles compile for macOS and for iOS, where the catalog carries the Any,
+Dark and Tinted renditions and the live iOS 26 layer stacks (see
+`docs/ios-icon-appearances.md`). SVG layers rasterize with CoreSVG on macOS
+and with resvg elsewhere, so `.icon` bundles also build on Linux.
 
 There is likely some missing functionality, in the unknown unknowns category.
 As more samples appear or issues get reported, better compatibility will be
