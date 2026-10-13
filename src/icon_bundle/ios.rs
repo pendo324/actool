@@ -142,6 +142,23 @@ pub fn compile_icon_bundles(
         .collect())
 }
 
+/// Render a bundle's flattened iOS appearances — the pixels that go into its
+/// Any / Dark / Tintable 1024 pt renditions — as straight RGBA, for previews
+/// and parity checks without a CoreUI decode.
+pub fn render_appearances(bundle: &Path) -> Result<Vec<(&'static str, Vec<u8>)>> {
+    let text = fs::read_to_string(bundle.join("icon.json"))?;
+    let parsed = IconJson::parse(&text)?;
+    let prefix = bundle_facet_prefix(bundle);
+    let (colors, gradients) = ios_palette(&prefix, &parsed);
+    let mut cache = RasterCache::default();
+    let mut out = Vec::new();
+    for (_, tag, look) in FLAT_APPEARANCES {
+        let scene = build_scene(bundle, &parsed, &colors, &gradients, look, &mut cache)?;
+        out.push((tag, ios_render::render(&scene)));
+    }
+    Ok(out)
+}
+
 struct BuiltBundle {
     renditions: Vec<Rendition>,
     facets: Vec<FacetEntry>,
@@ -768,6 +785,7 @@ fn build_scene(
                 y: pl.offset[1].round() as i32,
                 opacity: leff.map_or(1.0, |l| l.opacity),
                 blend: leff.map_or(Blend::Normal, |l| Blend::parse(&l.blend_mode)),
+                glass: leff.is_some_and(|l| l.glass),
                 fill,
             });
         }

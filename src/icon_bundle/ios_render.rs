@@ -119,14 +119,15 @@ pub struct SceneLayer {
     pub y: i32,
     pub opacity: f32,
     pub blend: Blend,
+    pub glass: bool,
     /// Solid fill replacing the layer's own colours (keeps its alpha).
     pub fill: Option<[f32; 3]>,
 }
 
-/// A group's layers (back-to-front) and its appearance-resolved effects. In
-/// the flattened renditions the group's translucency, specular rim and
-/// shadow apply to every layer, glass or not (a non-glass disc in a default
-/// group gets all three); the per-layer glass flag only matters live.
+/// A group's layers (back-to-front) and its appearance-resolved effects. The
+/// group's translucency and specular only act on its glass layers (a
+/// non-glass disc in a translucent group stays solid); its shadow is cast by
+/// every layer.
 pub struct SceneGroup {
     pub layers: Vec<SceneLayer>,
     pub opacity: f32,
@@ -149,17 +150,51 @@ pub struct Scene {
     pub groups: Vec<SceneGroup>,
 }
 
-/// Bottom-of-layer see-through exponent: a translucent group's layer is opaque
-/// at its top and lets `value · s^1.6` of the backdrop through at fraction `s`
-/// of its height (glass disc probe: t ≈ 0.16 / 0.38 / 0.46 at s = 0.5 / 0.8 /
-/// 1.0 for value 0.5).
-const TRANSLUCENCY_EXP: f32 = 1.6;
+/// See-through of a translucent group's glass, measured on a glass disc over
+/// black (tinted) for translucency values 0.12…1.0: the fraction of the
+/// backdrop showing through at fraction `s` down the glass. Opaque at the
+/// top, an S-shaped ramp towards the bottom whose depth grows faster than
+/// linearly with the value. Rows: value; columns: `TRANSLUCENCY_S`.
+const TRANSLUCENCY_S: [f32; 7] = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0];
+const TRANSLUCENCY_TABLE: [(f32, [f32; 7]); 6] = [
+    (0.0, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    (0.12, [0.0, 0.0, 0.007, 0.013, 0.020, 0.033, 0.046]),
+    (0.25, [0.0, 0.0, 0.013, 0.040, 0.093, 0.126, 0.152]),
+    (0.5, [0.0, 0.007, 0.046, 0.159, 0.318, 0.424, 0.450]),
+    (0.8, [0.0, 0.020, 0.106, 0.351, 0.649, 0.808, 0.815]),
+    (1.0, [0.0, 0.026, 0.159, 0.503, 0.841, 0.974, 0.974]),
+];
+
+fn interp(xs: &[f32], ys: &[f32], x: f32) -> f32 {
+    let x = x.clamp(xs[0], xs[xs.len() - 1]);
+    let i = xs.windows(2).position(|w| x <= w[1]).unwrap_or(xs.len() - 2);
+    let t = (x - xs[i]) / (xs[i + 1] - xs[i]).max(1e-6);
+    ys[i] + (ys[i + 1] - ys[i]) * t
+}
+
+fn translucency_see_through(value: f32, s: f32) -> f32 {
+    let at = |row: &[f32; 7]| interp(&TRANSLUCENCY_S, row, s);
+    let values: Vec<f32> = TRANSLUCENCY_TABLE.iter().map(|(v, _)| *v).collect();
+    let column: Vec<f32> = TRANSLUCENCY_TABLE.iter().map(|(_, row)| at(row)).collect();
+    interp(&values, &column, value)
+}
 
 /// Specular rim: a white highlight in a band 6…18 pt inside the
 /// layer edge, strongest (0.41 toward white) at its outer side.
 const SPECULAR_INNER: f32 = 6.0;
 const SPECULAR_WIDTH: f32 = 12.0;
-const SPECULAR_PEAK: f32 = 0.41;
+const SPECULAR_PEAK: f32 = 0.25;
+
+/// Glass edge: the outer rim of a glass layer is an opaque band (not
+/// see-through) that blends into the interior over ~24 pt. Without specular
+/// it is darker (0.84 × its colour) with a slight dip around 11 pt (t_trans
+/// probe: 124 at the edge → 112 at 10 pt → 128 interior); with specular it
+/// keeps the layer colour and carries the highlight instead (glass probe).
+const GLASS_EDGE_SHADE: f32 = 0.84;
+const GLASS_EDGE_WIDTH: f32 = 24.0;
+const GLASS_EDGE_DIP: f32 = 0.12;
+const GLASS_EDGE_DIP_AT: f32 = 11.0;
+const GLASS_EDGE_DIP_WIDTH: f32 = 6.0;
 
 /// Group drop shadow: offset down-right, blurred, and darkening the backdrop
 /// by `peak · opacity` at the edge (glass disc probe: −4.4 % beside the edge
@@ -176,6 +211,11 @@ const RIM_DEPTH: f32 = 22.0;
 /// the canvas edge ~140 pt from each corner and the diagonal at 51 pt).
 const RIM_CORNER_RADIUS: f32 = 138.0;
 const RIM_CORNER_EXP: f32 = 1.55;
+/// Rim strength (white screened over the tile) along the edge: a base level
+/// plus a top-left and a weaker bottom-right highlight; see [`rim_peak`].
+const RIM_BASE: f32 = 0.13;
+const RIM_TOP_LEFT: f32 = 0.65;
+const RIM_BOTTOM_RIGHT: f32 = 0.45;
 
 pub fn render(scene: &Scene) -> Vec<u8> {
     let size = scene.size;
@@ -193,7 +233,7 @@ pub fn render(scene: &Scene) -> Vec<u8> {
         draw_group(&mut canvas, size, k, group);
     }
     if scene.appearance != IosAppearance::Tinted {
-        apply_rim_light(&mut canvas, size, scene.appearance);
+        apply_rim_light(&mut canvas, size);
     }
     let mut out = vec![0u8; n * 4];
     for i in 0..n {
@@ -296,23 +336,44 @@ fn specular_amount(depth: f32) -> f32 {
     SPECULAR_PEAK * (1.0 - (depth - SPECULAR_INNER) / SPECULAR_WIDTH)
 }
 
+/// Weight of the interior (vs the opaque edge band) at depth `d` inside a
+/// glass layer.
+fn glass_interior_weight(d: f32) -> f32 {
+    let t = (d / GLASS_EDGE_WIDTH).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Composite a group: its layers are flattened into an isolated buffer (so a
+/// translucent group shows what lies *behind the group*, not its own lower
+/// layers — Apple's tinted eyes stay dark over the dome), then the group's
+/// see-through ramp (over its glass coverage), opacity and blend apply as a
+/// unit.
 fn draw_group(canvas: &mut [[f32; 3]], size: usize, k: f32, group: &SceneGroup) {
     let n = size * size;
-    let isolated = group.blend != Blend::Normal;
-    let layer_alpha_scale = if isolated { 1.0 } else { group.opacity };
-    let placed: Vec<Placed> = group
-        .layers
-        .iter()
-        .map(|l| place(l, size, l.opacity * layer_alpha_scale))
-        .collect();
-    if placed.iter().all(|p| p.bbox.is_none()) {
+    let placed: Vec<Placed> = group.layers.iter().map(|l| place(l, size, l.opacity)).collect();
+    let Some(bbox) = placed.iter().filter_map(|p| p.bbox).reduce(|a, b| {
+        (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+    }) else {
         return;
-    }
+    };
 
     let mut union = vec![0.0f32; n];
-    for p in &placed {
+    let mut glass_union = vec![0.0f32; n];
+    let mut glass_bbox: Option<(usize, usize, usize, usize)> = None;
+    for (layer, p) in group.layers.iter().zip(&placed) {
         for i in 0..n {
             union[i] = union[i] + p.alpha[i] * (1.0 - union[i]);
+            if layer.glass {
+                glass_union[i] = glass_union[i] + p.alpha[i] * (1.0 - glass_union[i]);
+            }
+        }
+        if layer.glass {
+            if let Some(b) = p.bbox {
+                glass_bbox = Some(match glass_bbox {
+                    None => b,
+                    Some(a) => (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)),
+                });
+            }
         }
     }
 
@@ -320,72 +381,97 @@ fn draw_group(canvas: &mut [[f32; 3]], size: usize, k: f32, group: &SceneGroup) 
         draw_shadow(canvas, size, k, group, &placed, &union);
     }
 
-    let group_depth = if group.specular && group.combined_lighting {
-        Some(inner_depth(&union, size, k))
-    } else {
-        None
-    };
-    let group_bbox = placed.iter().filter_map(|p| p.bbox).reduce(|a, b| {
-        (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
-    });
+    let glass_depth = glass_bbox.map(|_| inner_depth(&glass_union, size, k));
 
-    // Isolated groups composite into their own premultiplied buffer first.
-    let mut iso_rgb = vec![[0.0f32; 3]; if isolated { n } else { 0 }];
-    let mut iso_a = vec![0.0f32; if isolated { n } else { 0 }];
-
+    // Premultiplied group buffer.
+    let mut g_rgb = vec![[0.0f32; 3]; n];
+    let mut g_a = vec![0.0f32; n];
     for (layer, p) in group.layers.iter().zip(&placed) {
-        let Some(bbox) = p.bbox else { continue };
-        let depth = if group.specular && !group.combined_lighting {
-            Some(inner_depth(&p.alpha, size, k))
-        } else {
+        let Some(lb) = p.bbox else { continue };
+        let depth = if !layer.glass {
             None
+        } else if group.combined_lighting {
+            glass_depth.clone()
+        } else {
+            Some(inner_depth(&p.alpha, size, k))
         };
-        let ramp_box = if group.combined_lighting { group_bbox.unwrap_or(bbox) } else { bbox };
-        let (top, bottom) = (ramp_box.1 as f32, ramp_box.3 as f32);
-        for y in bbox.1..=bbox.3 {
-            let s = ((y as f32 - top) / (bottom - top).max(1.0)).clamp(0.0, 1.0);
-            let see_through = group.translucency.map_or(0.0, |v| v * s.powf(TRANSLUCENCY_EXP));
-            for x in bbox.0..=bbox.2 {
+        for y in lb.1..=lb.3 {
+            for x in lb.0..=lb.2 {
                 let i = y * size + x;
-                let mut a = p.alpha[i];
+                let a = p.alpha[i];
                 if a <= 0.0 {
                     continue;
                 }
-                a *= 1.0 - see_through;
                 let mut col = p.rgb[i];
-                if group.specular {
-                    let d = depth.as_ref().or(group_depth.as_ref()).map(|d| d[i]).unwrap_or(0.0);
-                    let h = specular_amount(d);
-                    for c in &mut col {
-                        *c += h * (1.0 - *c);
+                if let Some(depth) = &depth {
+                    let d = depth[i];
+                    if group.specular {
+                        let h = specular_amount(d);
+                        for c in &mut col {
+                            *c += h * (1.0 - *c);
+                        }
+                    } else {
+                        let w = glass_interior_weight(d);
+                        let dip = 1.0
+                            - GLASS_EDGE_DIP
+                                * (-((d - GLASS_EDGE_DIP_AT) / GLASS_EDGE_DIP_WIDTH).powi(2))
+                                    .exp();
+                        for c in &mut col {
+                            *c = (1.0 - w) * GLASS_EDGE_SHADE * *c + w * dip * *c;
+                        }
                     }
                 }
-                if isolated {
-                    for c in 0..3 {
-                        iso_rgb[i][c] = col[c] * a + iso_rgb[i][c] * (1.0 - a);
-                    }
-                    iso_a[i] = a + iso_a[i] * (1.0 - a);
+                // Additive layers (the antenna glow) light up whatever is
+                // behind the group too, so they bypass the isolated buffer.
+                if matches!(layer.blend, Blend::PlusLighter | Blend::PlusDarker) {
+                    composite(&mut canvas[i], col, a * group.opacity, layer.blend);
                 } else {
-                    composite(&mut canvas[i], col, a, layer.blend);
+                    composite_premul(&mut g_rgb[i], &mut g_a[i], col, a, layer.blend);
                 }
             }
         }
     }
 
-    if isolated {
-        for i in 0..n {
-            let a = iso_a[i] * group.opacity;
-            if a <= 0.0 {
+    let ramp = match (group.translucency, glass_bbox, &glass_depth) {
+        (Some(v), Some(gb), Some(gd)) => Some((v, gb, gd)),
+        _ => None,
+    };
+    for y in bbox.1..=bbox.3 {
+        for x in bbox.0..=bbox.2 {
+            let i = y * size + x;
+            if g_a[i] <= 0.0 {
                 continue;
             }
-            let col = [
-                iso_rgb[i][0] / iso_a[i],
-                iso_rgb[i][1] / iso_a[i],
-                iso_rgb[i][2] / iso_a[i],
-            ];
+            let see_through = ramp.map_or(0.0, |(v, gb, gd)| {
+                let s = ((y as f32 - gb.1 as f32) / (gb.3 as f32 - gb.1 as f32).max(1.0))
+                    .clamp(0.0, 1.0);
+                translucency_see_through(v, s) * glass_union[i] * glass_interior_weight(gd[i])
+            });
+            let a = g_a[i] * (1.0 - see_through) * group.opacity;
+            let col = [g_rgb[i][0] / g_a[i], g_rgb[i][1] / g_a[i], g_rgb[i][2] / g_a[i]];
             composite(&mut canvas[i], col, a, group.blend);
         }
     }
+}
+
+/// Source-over with a blend mode into a premultiplied, possibly transparent
+/// buffer (W3C compositing: the blend only applies where the backdrop has
+/// coverage).
+fn composite_premul(dst: &mut [f32; 3], dst_a: &mut f32, src: [f32; 3], a: f32, blend: Blend) {
+    let ab = *dst_a;
+    if blend == Blend::PlusLighter {
+        for c in 0..3 {
+            dst[c] = (dst[c] + src[c] * a).min(1.0);
+        }
+        *dst_a = (ab + a).min(1.0);
+        return;
+    }
+    for c in 0..3 {
+        let cb = if ab > 0.0 { dst[c] / ab } else { 0.0 };
+        let mixed = (1.0 - ab) * src[c] + ab * blend_channel(blend, cb, src[c]);
+        dst[c] = a * mixed + (1.0 - a) * dst[c];
+    }
+    *dst_a = a + ab * (1.0 - a);
 }
 
 fn draw_shadow(
@@ -537,21 +623,20 @@ fn rim_depth(x: f32, y: f32) -> f32 {
     (1.0 - g) / (gx * gx + gy * gy).sqrt().max(1e-6)
 }
 
-/// Peak sRGB lift of the rim at canvas point (x, y) for `appearance`. The
-/// light catches the top-left rim and, weaker, the bottom-right one: measured
-/// along the edges of a flat fill as a function of `u = (x + y) / 2048`.
-fn rim_peak(x: f32, y: f32, appearance: IosAppearance) -> f32 {
+/// Peak strength of the rim light at canvas point (x, y): it acts like white
+/// screened over the tile, with the same strength on light and dark
+/// backgrounds (the Any render of a dark icon carries the same rim as its
+/// Dark render). The light catches the top-left rim and, weaker, the
+/// bottom-right one: fitted along the edges of flat fills as a function of
+/// `u = (x + y) / 2048`.
+fn rim_peak(x: f32, y: f32) -> f32 {
     let u = (x + y) / 2048.0;
     let ramp = |a: f32, b: f32| ((u - a) / (b - a)).clamp(0.0, 1.0);
-    match appearance {
-        IosAppearance::Dark => {
-            18.0 + 132.0 * ramp(0.40, 0.10).powf(0.7) + 100.0 * ramp(0.60, 0.90).powf(0.8)
-        }
-        _ => 20.0 + 80.0 * ramp(0.42, 0.07).powf(0.8) + 52.0 * ramp(0.62, 0.92).powf(0.9),
-    }
+    RIM_BASE + RIM_TOP_LEFT * ramp(0.42, 0.07).powf(0.75)
+        + RIM_BOTTOM_RIGHT * ramp(0.62, 0.92).powf(0.85)
 }
 
-fn apply_rim_light(canvas: &mut [[f32; 3]], size: usize, appearance: IosAppearance) {
+fn apply_rim_light(canvas: &mut [[f32; 3]], size: usize) {
     let k = size as f32 / 1024.0;
     let band = (RIM_DEPTH + 2.0) * k;
     for y in 0..size {
@@ -565,9 +650,9 @@ fn apply_rim_light(canvas: &mut [[f32; 3]], size: usize, appearance: IosAppearan
             if d < 0.0 || d >= RIM_DEPTH {
                 continue;
             }
-            let lift = rim_peak(px, py, appearance) / 255.0 * (1.0 - d / RIM_DEPTH);
+            let a = (rim_peak(px, py) * (1.0 - d / RIM_DEPTH)).min(1.0);
             for c in &mut canvas[y * size + x] {
-                *c = (*c + lift).min(1.0);
+                *c += a * (1.0 - *c);
             }
         }
     }
@@ -608,6 +693,7 @@ mod tests {
             y: 120,
             opacity: 1.0,
             blend: Blend::Normal,
+            glass: false,
             fill: None,
         };
         let scene = Scene {
@@ -632,8 +718,7 @@ mod tests {
         assert_eq!(px(128, 128), &[54, 54, 54, 255]);
     }
 
-    #[test]
-    fn translucent_glass_shows_backdrop_at_the_bottom() {
+    fn slab(glass: bool) -> Scene {
         let layer = SceneLayer {
             rgba: [255u8, 255, 255, 255].repeat(100 * 100),
             w: 100,
@@ -642,9 +727,10 @@ mod tests {
             y: 78,
             opacity: 1.0,
             blend: Blend::Normal,
+            glass,
             fill: None,
         };
-        let scene = Scene {
+        Scene {
             size: 256,
             appearance: IosAppearance::Any,
             background: Some(flat([0.0, 0.0, 0.0])),
@@ -658,10 +744,31 @@ mod tests {
                 translucency: Some(0.5),
                 combined_lighting: false,
             }],
-        };
-        let out = render(&scene);
+        }
+    }
+
+    #[test]
+    fn translucent_glass_shows_backdrop_at_the_bottom() {
+        let out = render(&slab(true));
         let g = |y: usize| out[(y * 256 + 128) * 4] as i32;
-        assert_eq!(g(79), 255, "top of a glass layer is opaque");
-        assert!((g(177) - 128).abs() <= 3, "bottom lets half the backdrop through: {}", g(177));
+        assert!(g(86) >= 250, "top of a glass layer is opaque: {}", g(86));
+        // 93 % of the way down, a 0.5 translucency lets ~43 % through.
+        assert!((130..=160).contains(&g(170)), "bottom shows the backdrop: {}", g(170));
+        // The outer edge band is darker but not see-through.
+        assert!((200..=225).contains(&g(176)), "edge band: {}", g(176));
+    }
+
+    #[test]
+    fn translucency_only_affects_glass() {
+        let out = render(&slab(false));
+        assert_eq!(out[(170 * 256 + 128) * 4], 255);
+    }
+
+    #[test]
+    fn translucency_table_interpolates() {
+        assert_eq!(translucency_see_through(0.0, 0.9), 0.0);
+        assert!((translucency_see_through(1.0, 0.5) - 0.503).abs() < 1e-6);
+        let mid = translucency_see_through(0.65, 0.5);
+        assert!(mid > 0.159 && mid < 0.351);
     }
 }
