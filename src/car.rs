@@ -1424,6 +1424,15 @@ impl KeyformatRendition for Rendition {
     }
 }
 
+/// Bytes per pixel of an uncompressed bitmap format: BGRA and 16-bit
+/// gray+alpha (`61AG`) are 4, 8-bit gray+alpha is 2.
+fn bytes_per_pixel(pixel_format: &[u8; 4]) -> u32 {
+    match pixel_format {
+        b"BGRA" | b"61AG" => 4,
+        _ => 2,
+    }
+}
+
 fn check_opaque(pixel_data: &[u8], pixel_format: &[u8], width: u32, height: u32) -> bool {
     let width = width as usize;
     let height = height as usize;
@@ -1437,6 +1446,11 @@ fn check_opaque(pixel_data: &[u8], pixel_format: &[u8], width: u32, height: u32)
             }
         }
         true
+    } else if pixel_format == b"61AG" {
+        pixel_data
+            .chunks_exact(4)
+            .take(width * height)
+            .all(|px| px[2] == 0xFF && px[3] == 0xFF)
     } else if pixel_format == b" 8AG" {
         let bpr = width * 2;
         for row in 0..height {
@@ -1513,7 +1527,7 @@ impl Rendition {
                 let dmp2_min = min_dmp2_version(&self.platform);
                 let will_try_dmp2 =
                     use_dmp2 && deploy_ver >= dmp2_min && pixel_data.len() > 256;
-                let actual_bpp: u32 = if &self.pixel_format == b"BGRA" { 4 } else { 2 };
+                let actual_bpp = bytes_per_pixel(&self.pixel_format);
                 let padded_bpr = if will_try_dmp2 {
                     aligned_bytes_per_row(self.width, &self.pixel_format)
                 } else {
@@ -1554,7 +1568,7 @@ impl Rendition {
             let bpr = if actual_comp == 11 {
                 aligned_bytes_per_row(self.width, &self.pixel_format)
             } else if use_aligned {
-                let actual_bpp: u32 = if &self.pixel_format == b"BGRA" { 4 } else { 2 };
+                let actual_bpp = bytes_per_pixel(&self.pixel_format);
                 ((self.width * actual_bpp + 31) / 32) * 32
             } else {
                 self.width * 4
