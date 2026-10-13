@@ -61,10 +61,18 @@ pub struct Group {
     pub blur_material: Option<serde_json::Value>,
     #[serde(default, rename = "blur-material-specializations")]
     pub blur_material_specializations: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub lighting: Option<String>,
     #[serde(default, rename = "lighting-specializations")]
     pub lighting_specializations: Option<Vec<serde_json::Value>>,
+    #[serde(default, rename = "blend-mode")]
+    pub blend_mode: Option<String>,
     #[serde(default, rename = "blend-mode-specializations")]
     pub blend_mode_specializations: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub opacity: Option<f32>,
+    #[serde(default, rename = "opacity-specializations")]
+    pub opacity_specializations: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,8 +87,12 @@ pub struct Layer {
     pub hidden: Option<bool>,
     #[serde(default)]
     pub position: Option<Position>,
+    #[serde(default, rename = "blend-mode")]
+    pub blend_mode: Option<String>,
     #[serde(default, rename = "blend-mode-specializations")]
     pub blend_mode_specializations: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub opacity: Option<f32>,
     #[serde(default, rename = "hidden-specializations")]
     pub hidden_specializations: Option<Vec<serde_json::Value>>,
     #[serde(default, rename = "glass-specializations")]

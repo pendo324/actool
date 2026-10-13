@@ -86,6 +86,8 @@ pub struct IconEffects {
     pub blur_material: Option<f32>,
     pub lighting: Lighting,
     pub blend_mode: String,
+    /// Group opacity (plain `opacity` or `opacity-specializations`).
+    pub opacity: f32,
     pub layers: Vec<LayerEffects>,
 }
 
@@ -150,24 +152,24 @@ fn parse_blur(v: &Value) -> Option<f32> {
     v.get("value").and_then(|x| x.as_f64()).map(|x| x as f32)
 }
 
-fn resolve_layer(layer: &Layer, appearance: Appearance) -> LayerEffects {
+fn resolve_layer(layer: &Layer, appearance: Appearance, default_glass: bool) -> LayerEffects {
     let glass = resolve(
         layer.glass_specializations.as_ref(),
         layer.glass.map(Value::from).as_ref(),
         appearance,
         |v| v.as_bool(),
     )
-    .unwrap_or(false);
+    .unwrap_or(default_glass);
     let opacity = resolve(
         layer.opacity_specializations.as_ref(),
-        None,
+        layer.opacity.map(Value::from).as_ref(),
         appearance,
         |v| v.as_f64().map(|x| x as f32),
     )
     .unwrap_or(1.0);
     let blend_mode = resolve(
         layer.blend_mode_specializations.as_ref(),
-        None,
+        layer.blend_mode.clone().map(Value::from).as_ref(),
         appearance,
         |v| v.as_str().map(str::to_string),
     )
@@ -182,8 +184,46 @@ fn resolve_layer(layer: &Layer, appearance: Appearance) -> LayerEffects {
     LayerEffects { glass, opacity, blend_mode, hidden }
 }
 
+/// Fallbacks for group effects the icon.json leaves unset.
+#[derive(Debug, Clone, Copy)]
+pub struct EffectDefaults {
+    pub shadow: ShadowSpec,
+    pub specular: bool,
+    pub translucency: Translucency,
+    /// Whether a layer without a `glass` key is glass.
+    pub glass: bool,
+}
+
+/// The fallbacks the macOS renderer was tuned against.
+pub const RENDER_DEFAULTS: EffectDefaults = EffectDefaults {
+    shadow: ShadowSpec { kind: ShadowKind::None, opacity: 1.0 },
+    specular: false,
+    translucency: Translucency { enabled: false, value: 0.0 },
+    glass: false,
+};
+
+/// IconComposer's own defaults, as Apple's actool encodes them into an iOS
+/// iconstack for a group with no shadow/specular/translucency keys (neutral
+/// 0.5 shadow, specular on, translucency 0.5) and a layer without `glass`
+/// (glass).
+pub const ICON_COMPOSER_DEFAULTS: EffectDefaults = EffectDefaults {
+    shadow: ShadowSpec { kind: ShadowKind::Neutral, opacity: 0.5 },
+    specular: true,
+    translucency: Translucency { enabled: true, value: 0.5 },
+    glass: true,
+};
+
 /// Resolve every shading input for `group` at `appearance`.
 pub fn resolve_icon_effects(group: &Group, appearance: Appearance) -> IconEffects {
+    resolve_icon_effects_with(group, appearance, &RENDER_DEFAULTS)
+}
+
+/// [`resolve_icon_effects`] with explicit fallbacks for unset group effects.
+pub fn resolve_icon_effects_with(
+    group: &Group,
+    appearance: Appearance,
+    defaults: &EffectDefaults,
+) -> IconEffects {
     let plain_shadow = group
         .shadow
         .as_ref()
@@ -194,7 +234,7 @@ pub fn resolve_icon_effects(group: &Group, appearance: Appearance) -> IconEffect
         appearance,
         parse_shadow,
     )
-    .unwrap_or(ShadowSpec { kind: ShadowKind::None, opacity: 1.0 });
+    .unwrap_or(defaults.shadow);
 
     let specular = resolve(
         group.specular_specializations.as_ref(),
@@ -202,7 +242,7 @@ pub fn resolve_icon_effects(group: &Group, appearance: Appearance) -> IconEffect
         appearance,
         |v| v.as_bool(),
     )
-    .unwrap_or(false);
+    .unwrap_or(defaults.specular);
 
     let plain_trans = group.translucency.as_ref().map(|t| {
         serde_json::json!({"enabled": t.enabled.unwrap_or(false), "value": t.value.unwrap_or(0.0)})
@@ -213,7 +253,7 @@ pub fn resolve_icon_effects(group: &Group, appearance: Appearance) -> IconEffect
         appearance,
         parse_translucency,
     )
-    .unwrap_or(Translucency { enabled: false, value: 0.0 });
+    .unwrap_or(defaults.translucency);
 
     let blur_material = resolve(
         group.blur_material_specializations.as_ref(),
@@ -224,7 +264,7 @@ pub fn resolve_icon_effects(group: &Group, appearance: Appearance) -> IconEffect
 
     let lighting = match resolve(
         group.lighting_specializations.as_ref(),
-        None,
+        group.lighting.clone().map(Value::from).as_ref(),
         appearance,
         |v| v.as_str().map(str::to_string),
     )
@@ -236,16 +276,24 @@ pub fn resolve_icon_effects(group: &Group, appearance: Appearance) -> IconEffect
 
     let blend_mode = resolve(
         group.blend_mode_specializations.as_ref(),
-        None,
+        group.blend_mode.clone().map(Value::from).as_ref(),
         appearance,
         |v| v.as_str().map(str::to_string),
     )
     .unwrap_or_else(|| "normal".to_string());
 
+    let opacity = resolve(
+        group.opacity_specializations.as_ref(),
+        group.opacity.map(Value::from).as_ref(),
+        appearance,
+        |v| v.as_f64().map(|x| x as f32),
+    )
+    .unwrap_or(1.0);
+
     let layers = group
         .layers
         .iter()
-        .map(|l| resolve_layer(l, appearance))
+        .map(|l| resolve_layer(l, appearance, defaults.glass))
         .collect();
 
     IconEffects {
@@ -255,6 +303,7 @@ pub fn resolve_icon_effects(group: &Group, appearance: Appearance) -> IconEffect
         blur_material,
         lighting,
         blend_mode,
+        opacity,
         layers,
     }
 }
