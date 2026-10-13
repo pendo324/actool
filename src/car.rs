@@ -997,6 +997,153 @@ pub fn build_icongroup_csi(name: &str, child_dim: u32, layers: &[LayerRef]) -> V
     )
 }
 
+/// One child of an iOS iconstack / IconGroup rendition, with the per-layer
+/// attributes Apple encodes for live (iOS 26) rendering. Decoded from
+/// `xcrun actool --platform iphoneos` output on synthetic fixtures; see
+/// `docs/ios-icon-appearances.md` for the field-by-field derivation.
+#[derive(Debug, Clone, Default)]
+pub struct StackEntry {
+    pub part: u16,
+    pub identifier: u16,
+    /// Top-left offset of the layer in 1024-pt icon space (0x3F4).
+    pub offset: [i32; 2],
+    /// Layer size in points (0x3F4); 0 for iconstack children.
+    pub size: [u32; 2],
+    /// CGBlendMode value (0x3F4).
+    pub blend: u32,
+    pub opacity: f32,
+    /// 0x3FC flag word: glass (1/0) for an IconGroup layer, lighting
+    /// (2 = individual, 0 = combined) for an iconstack group.
+    pub flags: u32,
+    /// 0x3FC float: the group's blur-material (iconstack only).
+    pub blur: f32,
+    /// 0x3FC string: facet name of the layer's fill colour for this
+    /// appearance, empty when it keeps its own colours.
+    pub fill_name: String,
+    /// 0x3FD: specular, translucency (0 when disabled), shadow kind
+    /// (none 0, layer-color 2, neutral 3) and shadow opacity.
+    pub specular: bool,
+    pub translucency: f32,
+    pub shadow_kind: u32,
+    pub shadow_opacity: f32,
+}
+
+fn stack_entry_tlvs(entries: &[StackEntry]) -> Vec<u8> {
+    let mut t3f4 = Vec::new();
+    t3f4.write_u32::<LittleEndian>(entries.len() as u32).unwrap();
+    for e in entries {
+        t3f4.write_u32::<LittleEndian>(0).unwrap();
+        t3f4.write_u32::<LittleEndian>(0).unwrap();
+        t3f4.write_i32::<LittleEndian>(e.offset[0]).unwrap();
+        t3f4.write_i32::<LittleEndian>(e.offset[1]).unwrap();
+        t3f4.write_u32::<LittleEndian>(e.size[0]).unwrap();
+        t3f4.write_u32::<LittleEndian>(e.size[1]).unwrap();
+        t3f4.write_u32::<LittleEndian>(e.blend).unwrap();
+        t3f4.write_f32::<LittleEndian>(e.opacity).unwrap();
+        t3f4.write_u32::<LittleEndian>(16).unwrap();
+        write_layer_key_fragment(
+            &mut t3f4,
+            &LayerRef { part: e.part, identifier: e.identifier },
+        );
+    }
+    t3f4.extend(std::iter::repeat(0u8).take(4));
+
+    let mut t3fc = Vec::new();
+    t3fc.write_u32::<LittleEndian>(entries.len() as u32).unwrap();
+    t3fc.write_u32::<LittleEndian>(0).unwrap();
+    for e in entries {
+        t3fc.write_u32::<LittleEndian>(e.flags).unwrap();
+        t3fc.write_f32::<LittleEndian>(e.blur).unwrap();
+        t3fc.write_u32::<LittleEndian>(e.fill_name.len() as u32 + 1).unwrap();
+        t3fc.extend_from_slice(e.fill_name.as_bytes());
+        t3fc.write_u8(0).unwrap();
+    }
+
+    let mut t3fd = Vec::new();
+    t3fd.write_u32::<LittleEndian>(entries.len() as u32).unwrap();
+    for e in entries {
+        t3fd.write_u32::<LittleEndian>(0).unwrap();
+        t3fd.write_u32::<LittleEndian>(e.specular as u32).unwrap();
+        t3fd.write_f32::<LittleEndian>(e.translucency).unwrap();
+        t3fd.write_u32::<LittleEndian>(e.shadow_kind).unwrap();
+        t3fd.write_f32::<LittleEndian>(e.shadow_opacity).unwrap();
+    }
+    t3fd.extend(std::iter::repeat(0u8).take(4));
+
+    let mut tlv = Vec::new();
+    tlv.extend(tlv_header(0x03F4, t3f4.len() as u32));
+    tlv.extend(t3f4);
+    tlv.extend(tlv_header(0x03FC, t3fc.len() as u32));
+    tlv.extend(t3fc);
+    tlv.extend(tlv_header(0x03FD, t3fd.len() as u32));
+    tlv.extend(t3fd);
+    tlv
+}
+
+/// iOS iconstack rendition: the background fill followed by the groups
+/// back-to-front, each carrying its appearance-resolved attributes.
+pub fn build_ios_iconstack_csi(name: &str, dim: u32, entries: &[StackEntry]) -> Vec<u8> {
+    let mut tlv = stack_entry_tlvs(entries);
+    tlv.extend(make_blend_opacity_tlv());
+    tlv.extend(make_layered_uti_tlv());
+    tlv.extend(make_exif_orientation_tlv(1));
+    build_csi(
+        dim,
+        dim,
+        100,
+        PIXELFMT_DATA,
+        LAYOUT_ICONSTACK,
+        name,
+        &tlv,
+        &make_dwar_trailer(),
+        0,
+        0,
+        1,
+    )
+}
+
+/// iOS IconGroup rendition: the group's layers back-to-front with their
+/// placement, blend, opacity, glass flag and fill colour for one appearance.
+pub fn build_ios_icongroup_csi(name: &str, entries: &[StackEntry]) -> Vec<u8> {
+    let mut tlv = stack_entry_tlvs(entries);
+    tlv.extend(make_blend_opacity_tlv());
+    tlv.extend(make_exif_orientation_tlv(1));
+    build_csi(
+        0,
+        0,
+        100,
+        PIXELFMT_DATA,
+        LAYOUT_ICON_GROUP,
+        name,
+        &tlv,
+        &make_dwar_trailer(),
+        0,
+        0,
+        1,
+    )
+}
+
+/// APPEARANCEKEYS for an iOS IconComposer catalog.
+pub fn make_ios_appearancekeys_entries() -> Vec<(Vec<u8>, Vec<u8>)> {
+    [
+        ("ISAppearanceTintable", 10u16),
+        ("UIAppearanceAny", 0),
+        ("UIAppearanceDark", 1),
+        ("UIAppearanceLight", 4),
+    ]
+    .iter()
+    .map(|(name, id)| (name.as_bytes().to_vec(), id.to_le_bytes().to_vec()))
+    .collect()
+}
+
+/// Key format of an iOS IconComposer catalog. Unlike the appiconset path it
+/// has no localization column and ends with State (10).
+pub const KEYFORMAT_IOS_ICON: &[u16] = &[7, 12, 15, 16, 9, 17, 1, 2, 10];
+
+/// [`KEYFORMAT_IOS_ICON`] with the DisplayGamut column (24), present when a
+/// monochrome tinted icon is stored as an sRGB GA8 + P3 GA16 pair.
+pub const KEYFORMAT_IOS_ICON_GAMUT: &[u16] = &[7, 12, 15, 16, 9, 24, 17, 1, 2, 10];
+
 /// Length-prefixed UTI string ("public.layeredimage") wrapped as a 0x03ED
 /// TLV. Apple emits this in iconstack but not IconGroup.
 fn make_layered_uti_tlv() -> Vec<u8> {

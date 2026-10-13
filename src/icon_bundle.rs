@@ -13,6 +13,9 @@ use image::imageops::FilterType;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod ios;
+mod ios_render;
+
 /// One facet entry in the FACETKEYS tree: (facet_name, element, part, identifier).
 type FacetEntry = (String, u16, Option<u16>, u16);
 
@@ -74,7 +77,8 @@ fn pre_rendered_name(
     let tail_uuid =
         deterministic_uuid(&[icon_name, &pt_label, &scale_label, "tail"]);
     let tail_hex: String = tail_uuid.chars().filter(|c| *c != '-').collect();
-    let pid = &tail_hex[0..5];
+    // Apple's tail is the compiling process id in decimal, then 16 hex digits.
+    let pid = u32::from_str_radix(&tail_hex[0..5], 16).unwrap_or(0) % 90000 + 10000;
     let hex = &tail_hex[5..21];
     // Apple prefixes the pre-rendered name with the bundle stem (the
     // `--app-icon` name), not a literal "icon": feishin.icon → "feishin16x16…".
@@ -173,27 +177,7 @@ pub fn compile_icon_bundle(
     // the group has no `name` field. Anonymous groups fall back to
     // "Group", then "Group 2", "Group 3", … so each facet stays unique
     // across multi-group bundles like ding_icon.
-    let group_facet_names: Vec<String> = {
-        let mut anon_seq: u32 = 0;
-        parsed
-            .groups
-            .iter()
-            .map(|g| {
-                let n = match g.name.as_deref() {
-                    Some(n) => n.to_string(),
-                    None => {
-                        anon_seq += 1;
-                        if anon_seq == 1 {
-                            "Group".to_string()
-                        } else {
-                            format!("Group {anon_seq}")
-                        }
-                    }
-                };
-                format!("{facet_prefix}/{n}")
-            })
-            .collect()
-    };
+    let group_facet_names = group_facet_names(&facet_prefix, &parsed);
     let (color_assets, gradient_assets) =
         fill_assets(&facet_prefix, parsed.fill.as_ref(), &parsed)
             .unwrap_or_else(|| (Vec::new(), Vec::new()));
@@ -348,6 +332,30 @@ pub fn compile_icon_bundle(
         output_files.push(fs::canonicalize(path).unwrap_or(path.to_path_buf()));
     }
     Ok(output_files)
+}
+
+/// `<stem>/<group_name>` facet per group. Anonymous groups fall back to
+/// "Group", then "Group 2", "Group 3", … so each facet stays unique.
+fn group_facet_names(facet_prefix: &str, parsed: &IconJson) -> Vec<String> {
+    let mut anon_seq: u32 = 0;
+    parsed
+        .groups
+        .iter()
+        .map(|g| {
+            let n = match g.name.as_deref() {
+                Some(n) => n.to_string(),
+                None => {
+                    anon_seq += 1;
+                    if anon_seq == 1 {
+                        "Group".to_string()
+                    } else {
+                        format!("Group {anon_seq}")
+                    }
+                }
+            };
+            format!("{facet_prefix}/{n}")
+        })
+        .collect()
 }
 
 /// Build a `<stem>_Assets/<layer_name>` facet entry for each layer that
@@ -1370,6 +1378,157 @@ fn build_icon_car(
             gid,
         ));
     }
+    let (asset_renditions, asset_facets) = asset_renditions(
+        layer_assets,
+        color_assets,
+        gradient_assets,
+        &placeholder_kf,
+        platform,
+        min_deploy,
+    )?;
+    renditions.extend(asset_renditions);
+    facets.extend(asset_facets);
+
+    // Apple emits iconstack + IconGroup per non-system appearance for .icon
+    // bundles. Only meaningful when we have a group + at least one image
+    // layer + gradients to back the appearance variants.
+    let layered = !group_facet_names.is_empty()
+        && !layer_assets.is_empty()
+        && !gradient_assets.is_empty();
+    if layered {
+        let main_ident = hash_name(icon_name);
+        let stack_name = format!("{icon_name}.iconstack");
+        // Each group becomes a PART_ICON_GROUP facet whose IconGroup rendition
+        // references that group's own image layers (PART_REGULAR). Previously
+        // only the first group was wired, so a second group's facet had a
+        // FACETKEYS entry but no rendition — absent from BITMAPKEYS, it made
+        // CUICatalog return "no images" (Rectangle's Overlay facet). Build the
+        // per-group ident + layer refs so every group resolves.
+        let group_infos: Vec<(u16, Vec<car::LayerRef>)> = group_facet_names
+            .iter()
+            .zip(groups.iter())
+            .map(|(facet, g)| {
+                let ident = hash_name(facet);
+                let layer_refs: Vec<car::LayerRef> = g
+                    .layers
+                    .iter()
+                    .filter(|l| l.hidden != Some(true))
+                    .filter_map(|l| {
+                        let img = l.image_name.as_deref()?;
+                        let stem = std::path::Path::new(img)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(img);
+                        Some(car::LayerRef {
+                            part: car::PART_REGULAR,
+                            identifier: hash_name(&format!("{icon_name}_Assets/{stem}")),
+                        })
+                    })
+                    .collect();
+                (ident, layer_refs)
+            })
+            .filter(|(_, refs)| !refs.is_empty())
+            .collect();
+        // Map appearance ID -> gradient facet name. 1=DarkAqua uses the
+        // second (dark) gradient; 8=Aqua and 10=Tintable use the first.
+        let grad1_ident = hash_name(&gradient_assets[0].facet_name);
+        let grad2_ident = hash_name(
+            &gradient_assets
+                .get(1)
+                .map(|g| g.facet_name.clone())
+                .unwrap_or_else(|| gradient_assets[0].facet_name.clone()),
+        );
+        for appearance in [1u16, 8, 10] {
+            let grad_id = if appearance == 1 { grad2_ident } else { grad1_ident };
+            // Stack the gradient at the bottom, then the groups back-to-front.
+            // icon.json lists groups front-to-back (index 0 topmost), so the
+            // painter's order reverses them.
+            let mut stack_layers = vec![car::LayerRef {
+                part: car::PART_ICON_GRADIENT,
+                identifier: grad_id,
+            }];
+            for (ident, _) in group_infos.iter().rev() {
+                stack_layers.push(car::LayerRef {
+                    part: car::PART_ICON_GROUP,
+                    identifier: *ident,
+                });
+            }
+            let stack_csi = car::build_iconstack_csi(&stack_name, 1024, &stack_layers);
+            renditions.push(Rendition {
+                name: stack_name.clone(),
+                identifier: main_ident,
+                element: car::ELEMENT_UNIVERSAL,
+                part: car::PART_ICON_COMPOSER,
+                scale: 1,
+                appearance,
+                width: 1024,
+                height: 1024,
+                pixel_data: Vec::new(),
+                pixel_format: *car::PIXELFMT_DATA,
+                layout: car::LAYOUT_ICONSTACK,
+                keyformat: placeholder_kf.clone(),
+                min_deploy: min_deploy.to_string(),
+                platform: platform.to_string(),
+                colorspace_id: 0,
+                csi_override: Some(stack_csi),
+                ..Rendition::default()
+            });
+
+            for (group_ident, layer_refs) in &group_infos {
+                let group_csi = car::build_icongroup_csi("IconGroup", 1024, layer_refs);
+                renditions.push(Rendition {
+                    name: "IconGroup".to_string(),
+                    identifier: *group_ident,
+                    element: car::ELEMENT_UNIVERSAL,
+                    part: car::PART_ICON_GROUP,
+                    scale: 1,
+                    appearance,
+                    width: 0,
+                    height: 0,
+                    pixel_data: Vec::new(),
+                    pixel_format: *car::PIXELFMT_DATA,
+                    layout: car::LAYOUT_ICON_GROUP,
+                    keyformat: placeholder_kf.clone(),
+                    min_deploy: min_deploy.to_string(),
+                    platform: platform.to_string(),
+                    colorspace_id: 0,
+                    csi_override: Some(group_csi),
+                    ..Rendition::default()
+                });
+            }
+        }
+    }
+
+    let keyformat = car::compute_keyformat(&renditions, false);
+    for rend in &mut renditions {
+        rend.keyformat = keyformat.clone();
+    }
+
+    let mut all_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for rend in &renditions {
+        let key = rend.build_rendition_key();
+        let csi = rend.build_csi();
+        all_entries.push((key, csi));
+    }
+    all_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    write_icon_car(car_path, &facets, &keyformat, &all_entries, platform, min_deploy)
+}
+
+/// Renditions + facets for a bundle's layer sources (Vector for SVG, bitmap
+/// otherwise) and its Color / Gradient palette. Shared by the macOS and iOS
+/// catalog builders.
+fn asset_renditions(
+    layer_assets: &[LayerAsset],
+    color_assets: &[ColorAsset],
+    gradient_assets: &[GradientAsset],
+    placeholder_kf: &[u16],
+    platform: &str,
+    min_deploy: &str,
+) -> Result<(Vec<Rendition>, Vec<FacetEntry>)> {
+    let placeholder_kf = placeholder_kf.to_vec();
+    let mut renditions: Vec<Rendition> = Vec::new();
+    let mut facets: Vec<FacetEntry> = Vec::new();
     for asset in layer_assets {
         let asset_ident = hash_name(&asset.facet_name);
         let is_svg = asset
@@ -1521,130 +1680,7 @@ fn build_icon_car(
         ));
     }
 
-    // Apple emits iconstack + IconGroup per non-system appearance for .icon
-    // bundles. Only meaningful when we have a group + at least one image
-    // layer + gradients to back the appearance variants.
-    let layered = !group_facet_names.is_empty()
-        && !layer_assets.is_empty()
-        && !gradient_assets.is_empty();
-    if layered {
-        let main_ident = hash_name(icon_name);
-        let stack_name = format!("{icon_name}.iconstack");
-        // Each group becomes a PART_ICON_GROUP facet whose IconGroup rendition
-        // references that group's own image layers (PART_REGULAR). Previously
-        // only the first group was wired, so a second group's facet had a
-        // FACETKEYS entry but no rendition — absent from BITMAPKEYS, it made
-        // CUICatalog return "no images" (Rectangle's Overlay facet). Build the
-        // per-group ident + layer refs so every group resolves.
-        let group_infos: Vec<(u16, Vec<car::LayerRef>)> = group_facet_names
-            .iter()
-            .zip(groups.iter())
-            .map(|(facet, g)| {
-                let ident = hash_name(facet);
-                let layer_refs: Vec<car::LayerRef> = g
-                    .layers
-                    .iter()
-                    .filter(|l| l.hidden != Some(true))
-                    .filter_map(|l| {
-                        let img = l.image_name.as_deref()?;
-                        let stem = std::path::Path::new(img)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(img);
-                        Some(car::LayerRef {
-                            part: car::PART_REGULAR,
-                            identifier: hash_name(&format!("{icon_name}_Assets/{stem}")),
-                        })
-                    })
-                    .collect();
-                (ident, layer_refs)
-            })
-            .filter(|(_, refs)| !refs.is_empty())
-            .collect();
-        // Map appearance ID -> gradient facet name. 1=DarkAqua uses the
-        // second (dark) gradient; 8=Aqua and 10=Tintable use the first.
-        let grad1_ident = hash_name(&gradient_assets[0].facet_name);
-        let grad2_ident = hash_name(
-            &gradient_assets
-                .get(1)
-                .map(|g| g.facet_name.clone())
-                .unwrap_or_else(|| gradient_assets[0].facet_name.clone()),
-        );
-        for appearance in [1u16, 8, 10] {
-            let grad_id = if appearance == 1 { grad2_ident } else { grad1_ident };
-            // Stack the gradient at the bottom, then the groups back-to-front.
-            // icon.json lists groups front-to-back (index 0 topmost), so the
-            // painter's order reverses them.
-            let mut stack_layers = vec![car::LayerRef {
-                part: car::PART_ICON_GRADIENT,
-                identifier: grad_id,
-            }];
-            for (ident, _) in group_infos.iter().rev() {
-                stack_layers.push(car::LayerRef {
-                    part: car::PART_ICON_GROUP,
-                    identifier: *ident,
-                });
-            }
-            let stack_csi = car::build_iconstack_csi(&stack_name, 1024, &stack_layers);
-            renditions.push(Rendition {
-                name: stack_name.clone(),
-                identifier: main_ident,
-                element: car::ELEMENT_UNIVERSAL,
-                part: car::PART_ICON_COMPOSER,
-                scale: 1,
-                appearance,
-                width: 1024,
-                height: 1024,
-                pixel_data: Vec::new(),
-                pixel_format: *car::PIXELFMT_DATA,
-                layout: car::LAYOUT_ICONSTACK,
-                keyformat: placeholder_kf.clone(),
-                min_deploy: min_deploy.to_string(),
-                platform: platform.to_string(),
-                colorspace_id: 0,
-                csi_override: Some(stack_csi),
-                ..Rendition::default()
-            });
-
-            for (group_ident, layer_refs) in &group_infos {
-                let group_csi = car::build_icongroup_csi("IconGroup", 1024, layer_refs);
-                renditions.push(Rendition {
-                    name: "IconGroup".to_string(),
-                    identifier: *group_ident,
-                    element: car::ELEMENT_UNIVERSAL,
-                    part: car::PART_ICON_GROUP,
-                    scale: 1,
-                    appearance,
-                    width: 0,
-                    height: 0,
-                    pixel_data: Vec::new(),
-                    pixel_format: *car::PIXELFMT_DATA,
-                    layout: car::LAYOUT_ICON_GROUP,
-                    keyformat: placeholder_kf.clone(),
-                    min_deploy: min_deploy.to_string(),
-                    platform: platform.to_string(),
-                    colorspace_id: 0,
-                    csi_override: Some(group_csi),
-                    ..Rendition::default()
-                });
-            }
-        }
-    }
-
-    let keyformat = car::compute_keyformat(&renditions, false);
-    for rend in &mut renditions {
-        rend.keyformat = keyformat.clone();
-    }
-
-    let mut all_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for rend in &renditions {
-        let key = rend.build_rendition_key();
-        let csi = rend.build_csi();
-        all_entries.push((key, csi));
-    }
-    all_entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-    write_icon_car(car_path, &facets, &keyformat, &all_entries, platform, min_deploy)
+    Ok((renditions, facets))
 }
 
 /// A layer's source image, emitted as a `<stem>_Assets/<layer_name>` facet
@@ -2351,10 +2387,12 @@ fn append_layer_fills(
     grad_floor: usize,
 ) {
     for (_group, layer) in json.iter_layers() {
+        // A plain `fill` wins: Apple drops the layer's fill-specializations
+        // entirely when both are present (an iOS probe with a red plain fill
+        // and a blue dark specialization emitted no blue Color).
         if let Some(Fill::Structured(v)) = layer.fill.as_ref() {
             process_fill_value(v, None, facet_prefix, colors, gradients, grad_floor);
-        }
-        if let Some(specs) = layer.fill_specializations.as_ref() {
+        } else if let Some(specs) = layer.fill_specializations.as_ref() {
             for sp in specs {
                 let appearance = sp.get("appearance").and_then(|a| a.as_str());
                 if let Some(v) = sp.get("value") {
@@ -2433,13 +2471,38 @@ fn write_icon_car(
     platform: &str,
     min_deploy: &str,
 ) -> Result<()> {
+    write_icon_car_with(
+        car_path,
+        facets,
+        keyformat,
+        all_entries,
+        platform,
+        min_deploy,
+        1,
+        car::make_appearancekeys_entries(),
+    )
+}
+
+/// [`write_icon_car`] with the platform-specific CARHEADER key semantics and
+/// APPEARANCEKEYS (iOS declares key semantics 2 and the UIAppearance names).
+#[allow(clippy::too_many_arguments)]
+fn write_icon_car_with(
+    car_path: &Path,
+    facets: &[FacetEntry],
+    keyformat: &[u16],
+    all_entries: &[(Vec<u8>, Vec<u8>)],
+    platform: &str,
+    min_deploy: &str,
+    key_semantics: u32,
+    mut appearance_entries: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<()> {
     let mut bom = BomWriter::new();
     // Declare CoreUI 975 so the IconComposer code paths in CoreUI activate
     // — older values cause silent `imagesWithName:` empty results even when
     // FACETKEYS / RENDITIONS are byte-identical to Apple's output.
     bom.add_named_block(
         "CARHEADER",
-        car::make_carheader_versioned(all_entries.len() as u32, 975),
+        car::make_carheader_full(all_entries.len() as u32, 975, key_semantics),
     );
     // The named-block ORDER below matches Apple's actool exactly. CUICatalog
     // appears to scan named blocks during initWithURL: in BOM order and
@@ -2460,7 +2523,6 @@ fn write_icon_car(
     facetkey_entries.sort_by(|a, b| a.0.cmp(&b.0));
     bom.add_tree("FACETKEYS", &facetkey_entries, 4096);
 
-    let mut appearance_entries = car::make_appearancekeys_entries();
     appearance_entries.sort_by(|a, b| a.0.cmp(&b.0));
     bom.add_tree("APPEARANCEKEYS", &appearance_entries, 4096);
 
@@ -2576,12 +2638,14 @@ mod tests {
         let n = pre_rendered_name("feishin", 16, 2, "NSAppearanceNameSystem");
         assert!(n.starts_with("feishin16x16_NSAppearanceNameSystem_"));
         assert!(n.ends_with(".png"));
-        // Pattern: prefix + UUID(8-4-4-4-12) + - + 5 hex + - + 16 hex + .png
+        // Pattern: prefix + UUID(8-4-4-4-12) + - + decimal pid + - + 16 hex + .png
         let body = n
             .trim_start_matches("feishin16x16_NSAppearanceNameSystem_")
             .trim_end_matches(".png");
         let parts: Vec<&str> = body.split('-').collect();
         assert_eq!(parts.len(), 7, "expected UUID-PID-HEX shape, got {n:?}");
+        assert!(parts[5].chars().all(|c| c.is_ascii_digit()), "pid is decimal: {n:?}");
+        assert_eq!(parts[6].len(), 16);
     }
 
     #[test]

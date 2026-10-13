@@ -11,8 +11,9 @@ const SHORT_BUNDLE_VERSION: &str = "26.3";
 #[derive(Parser, Debug)]
 #[command(name = "actool", about = "Compiles, prints, updates, and verifies asset catalogs.")]
 struct Cli {
-    /// Path to .xcassets document
-    document: Option<PathBuf>,
+    /// Path to .xcassets document, or one or more .icon bundles (several only
+    /// for iOS, where alternates share one Assets.car)
+    documents: Vec<PathBuf>,
 
     /// Output format
     #[arg(long, default_value = "xml1",
@@ -107,7 +108,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let Some(document) = cli.document.clone() else {
+    let Some(document) = cli.documents.first().cloned() else {
         eprintln!("error: a document path is required");
         return ExitCode::from(2);
     };
@@ -194,8 +195,35 @@ fn main() -> ExitCode {
         "NO"
     );
 
+    let all_icons = cli.documents.iter().all(|d| icon_bundle::is_icon_bundle(d));
+    if cli.documents.len() > 1 && !(all_icons && actool::car::is_idiom_platform(&cli.platform)) {
+        eprintln!("error: multiple documents are only supported for iOS .icon bundles");
+        return ExitCode::from(2);
+    }
+
     // Dispatch to icon bundle handler when the document is a .icon bundle
-    let output_files = if icon_bundle::is_icon_bundle(&document) {
+    let output_files = if all_icons && actool::car::is_idiom_platform(&cli.platform) {
+        let alternates: Vec<String> =
+            cli.alternate_app_icon.iter().filter(|s| !s.is_empty()).cloned().collect();
+        let devices: Vec<String> =
+            cli.target_device.iter().filter(|s| !s.is_empty()).cloned().collect();
+        let opts = icon_bundle::ios::IosIconOptions {
+            platform: &cli.platform,
+            min_deploy: &cli.minimum_deployment_target,
+            app_icon: cli.app_icon.as_deref(),
+            alternate_app_icons: &alternates,
+            include_all_app_icons: cli.include_all_app_icons,
+            target_devices: &devices,
+            info_plist_path: cli.output_partial_info_plist.as_deref(),
+        };
+        match icon_bundle::ios::compile_icon_bundles(&cli.documents, &compile_dir, &opts) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("error compiling icon bundle: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else if icon_bundle::is_icon_bundle(&document) {
         match icon_bundle::compile_icon_bundle(
             &document,
             &compile_dir,
