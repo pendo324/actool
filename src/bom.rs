@@ -51,6 +51,16 @@ impl BomWriter {
     ) -> usize {
         // Entry format: value_block_idx(4) + key_block_idx(4) = 8 bytes
         // Node header: isLeaf(2) + count(2) + forward(4) + backward(4) = 12 bytes
+        //
+        // Apple splits a full tree into several leaves under an internal node.
+        // CoreUI can't read the values of any leaf but the last in the trees
+        // this writes that way (assetutil: "can't get size of value"), so a
+        // tree keeps one leaf and grows the node size instead, which the
+        // tree header records and CoreUI reads.
+        let mut block_size = block_size;
+        while ((block_size as usize) - 12) / 8 < entries.len() {
+            block_size *= 2;
+        }
         let max_per_node = ((block_size as usize) - 12) / 8;
 
         if entries.is_empty() {
